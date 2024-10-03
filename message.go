@@ -156,6 +156,8 @@ type Message struct {
 
 	// A poll object.
 	Poll *Poll `json:"poll"`
+
+	Nonce string `json:"nonce,omitempty"` // 添加 Nonce 字段
 }
 
 // UnmarshalJSON is a helper function to unmarshal the Message.
