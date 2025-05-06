@@ -45,6 +45,26 @@ type resumePacket struct {
 	} `json:"d"`
 }
 
+// 设置基础URL
+func (s *Session) SetBaseURL(baseURL string) {
+	s.baseURL = baseURL
+}
+
+// 设置网关
+func (s *Session) SetGateway(gateway string) {
+	s.gateway = gateway
+}
+
+// 设置Cookie
+func (s *Session) SetCookie(cookie string) {
+	s.cookie = cookie
+}
+
+// 设置镜像适配器
+func (s *Session) SetMirrorZlibAdapter(mirrorZlibAdapter *MirrorZlibAdapter) {
+	s.mirrorZlibAdapter = mirrorZlibAdapter
+}
+
 // Open creates a websocket connection to Discord.
 // See: https://discord.com/developers/docs/topics/gateway#connecting
 func (s *Session) Open() error {
@@ -74,9 +94,22 @@ func (s *Session) Open() error {
 	}
 
 	// Connect to the Gateway
-	s.log(LogInformational, "connecting to gateway %s", s.gateway)
 	header := http.Header{}
-	header.Add("accept-encoding", "zlib")
+	//重置适配器
+	if s.mirrorZlibAdapter != nil {
+		header.Add("accept-encoding", "gzip, deflate, br, zstd")
+		if s.cookie != "" {
+			header.Set("Cookie", s.cookie)
+		}
+		s.gateway = s.gateway + "&compress=zlib-stream"
+
+		s.mirrorZlibAdapter.Reset()
+	} else {
+		header.Add("accept-encoding", "zlib")
+	}
+
+	s.log(LogInformational, "connecting to gateway %s", s.gateway)
+
 	s.wsConn, _, err = s.Dialer.Dial(s.gateway, header)
 	if err != nil {
 		s.log(LogError, "error connecting to gateway %s, %s", s.gateway, err)
@@ -563,27 +596,55 @@ func (s *Session) onEvent(messageType int, message []byte) (*Event, error) {
 	// If this is a compressed message, uncompress it.
 	if messageType == websocket.BinaryMessage {
 
-		z, err2 := zlib.NewReader(reader)
-		if err2 != nil {
-			s.log(LogError, "error uncompressing websocket message, %s", err)
-			return nil, err2
-		}
-
-		defer func() {
-			err3 := z.Close()
-			if err3 != nil {
-				s.log(LogWarning, "error closing zlib, %s", err)
+		// 如果适配器不是空
+		if s.mirrorZlibAdapter != nil {
+			// 将压缩消息追加到适配器的缓冲区
+			err := s.mirrorZlibAdapter.AppendMessage(message)
+			if err != nil {
+				// 追加失败通常意味着内部状态问题或严重错误，可以考虑重连
+				go s.reconnect()
+				s.log(LogError, "error appending message to mirror adapter: %s", err)
+				return nil, err
 			}
-		}()
+			// 将适配器本身作为 io.Reader，json.Decoder 会从中流式读取解压数据
+			reader = s.mirrorZlibAdapter
+		} else {
+			//正常方法
+			z, err2 := zlib.NewReader(reader)
+			if err2 != nil {
+				s.log(LogError, "error uncompressing websocket message, %s", err2)
+				return nil, err2
+			}
 
-		reader = z
+			defer func() {
+				err3 := z.Close()
+				if err3 != nil {
+					s.log(LogWarning, "error closing zlib, %s", err)
+				}
+			}()
+
+			reader = z
+		}
 	}
 
 	// Decode the event into an Event struct.
 	var e *Event
 	decoder := json.NewDecoder(reader)
 	if err = decoder.Decode(&e); err != nil {
-		s.log(LogError, "error decoding websocket message, %s", err)
+		// 记录错误和部分数据
+		s.log(LogError, "error decoding websocket message: %s", err)
+		s.log(LogDebug, "Raw message hex for previous error: %x", message)
+
+		if s.mirrorZlibAdapter != nil {
+			err = s.mirrorZlibAdapter.HandleError()
+			if err != nil {
+				s.log(LogError, "error handling mirror zlib adapter: %s", err)
+				//重置失败的话重启ws
+				go s.reconnect()
+				return nil, err
+			}
+		}
+
 		return e, err
 	}
 
@@ -697,10 +758,10 @@ type voiceChannelJoinOp struct {
 
 // ChannelVoiceJoin joins the session user to a voice channel.
 //
-//    gID     : Guild ID of the channel to join.
-//    cID     : Channel ID of the channel to join.
-//    mute    : If true, you will be set to muted upon joining.
-//    deaf    : If true, you will be set to deafened upon joining.
+//	gID     : Guild ID of the channel to join.
+//	cID     : Channel ID of the channel to join.
+//	mute    : If true, you will be set to muted upon joining.
+//	deaf    : If true, you will be set to deafened upon joining.
 func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *VoiceConnection, err error) {
 
 	s.log(LogInformational, "called")
@@ -744,10 +805,10 @@ func (s *Session) ChannelVoiceJoin(gID, cID string, mute, deaf bool) (voice *Voi
 //
 // This should only be used when the VoiceServerUpdate will be intercepted and used elsewhere.
 //
-//    gID     : Guild ID of the channel to join.
-//    cID     : Channel ID of the channel to join, leave empty to disconnect.
-//    mute    : If true, you will be set to muted upon joining.
-//    deaf    : If true, you will be set to deafened upon joining.
+//	gID     : Guild ID of the channel to join.
+//	cID     : Channel ID of the channel to join, leave empty to disconnect.
+//	mute    : If true, you will be set to muted upon joining.
+//	deaf    : If true, you will be set to deafened upon joining.
 func (s *Session) ChannelVoiceJoinManual(gID, cID string, mute, deaf bool) (err error) {
 
 	s.log(LogInformational, "called")
@@ -946,6 +1007,15 @@ func (s *Session) CloseWithCode(closeCode int) (err error) {
 	s.Lock()
 
 	s.DataReady = false
+
+	//关闭适配器
+	if s.mirrorZlibAdapter != nil {
+		if err := s.mirrorZlibAdapter.Close(); err != nil {
+			s.log(LogError, "mirrorZlibAdapter关闭失败 %s, %s", s.gateway, err)
+		} else {
+			fmt.Println("适配器关闭成功")
+		}
+	}
 
 	if s.listening != nil {
 		s.log(LogInformational, "closing listening channel")

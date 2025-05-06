@@ -193,12 +193,15 @@ func (s *Session) request(method, urlStr, contentType string, b []byte, bucketID
 
 // RequestWithLockedBucket makes a request using a bucket that's already been locked
 func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b []byte, bucket *Bucket, sequence int, options ...RequestOption) (response []byte, err error) {
+
+	finalURL := s.prepareAPIURL(urlStr) // <--- 使用 prepareAPIURL 处理 URL
+
 	if s.Debug {
-		log.Printf("API REQUEST %8s :: %s\n", method, urlStr)
+		log.Printf("API REQUEST %8s :: %s\n", method, finalURL)
 		log.Printf("API REQUEST  PAYLOAD :: [%s]\n", string(b))
 	}
 
-	req, err := http.NewRequest(method, urlStr, bytes.NewBuffer(b))
+	req, err := http.NewRequest(method, finalURL, bytes.NewBuffer(b))
 	if err != nil {
 		bucket.Release(nil)
 		return
@@ -208,6 +211,11 @@ func (s *Session) RequestWithLockedBucket(method, urlStr, contentType string, b 
 	// TODO: Verify if a login, otherwise complain about no-token
 	if s.Token != "" {
 		req.Header.Set("authorization", s.Token)
+	}
+
+	//Cookie
+	if s.cookie != "" {
+		req.Header.Set("Cookie", s.cookie)
 	}
 
 	// Discord's API returns a 400 Bad Request is Content-Type is set, but the
@@ -3499,4 +3507,66 @@ func (s *Session) PollExpire(channelID, messageID string) (msg *Message, err err
 
 	err = unmarshal(body, &msg)
 	return
+}
+
+// prepareAPIURL 根据 Session 设置的 baseURL 调整 API 端点 URL
+// 假设 s.baseURL 存储的是基础域名，例如 "your-proxy.com" 或 "https://your-proxy.com"
+func (s *Session) prepareAPIURL(originalURL string) string {
+	// 如果没有设置自定义 baseURL (假设在 structs.go 中已添加 baseURL 字段)
+	if s.baseURL == "" {
+		return originalURL
+	}
+
+	// 1. 解析原始 URL
+	parsedOriginalURL, err := url.Parse(originalURL)
+	if err != nil {
+		s.log(LogError, "prepareAPIURL: Failed to parse original URL '%s': %v", originalURL, err)
+		return originalURL // 解析失败则返回原始 URL
+	}
+
+	// 2. 检查 Host 是否需要替换
+	//    这里我们只替换主要的 API 域名 "discord.com"
+	//    如果需要替换 CDN ("cdn.discordapp.com") 或 Status API ("status.discord.com") 等，
+	//    可以在这里添加更多 host 或使用更复杂的逻辑（可能需要 s.cdnURL, s.statusURL 等字段）
+	hostsToReplace := map[string]bool{
+		"discord.com": true,
+		// "cdn.discordapp.com": true, // 如果需要替换 CDN
+		// "status.discord.com": true, // 如果需要替换 Status
+	}
+
+	if _, shouldReplace := hostsToReplace[parsedOriginalURL.Host]; !shouldReplace {
+		// 不需要替换，返回原始 URL
+		return originalURL
+	}
+
+	// 3. 获取新的 Host 和 Scheme
+	var newHost string
+	newScheme := parsedOriginalURL.Scheme // 默认保留原始协议
+
+	if strings.Contains(s.baseURL, "://") {
+		parsedBase, parseErr := url.Parse(s.baseURL)
+		if parseErr != nil {
+			s.log(LogError, "prepareAPIURL: Failed to parse custom base URL '%s': %v", s.baseURL, parseErr)
+			return originalURL // 自定义 URL 无效则返回原始 URL
+		}
+		// 如果自定义 URL 包含协议，我们使用它的 Host 和 Scheme
+		newHost = parsedBase.Host
+		newScheme = parsedBase.Scheme
+	} else {
+		// 如果 s.baseURL 不包含协议，我们假定它就是 host[:port]
+		newHost = s.baseURL
+		// 保留原始 URL 的协议 (newScheme 已经等于 parsedOriginalURL.Scheme)
+	}
+
+	// 4. 替换 Host 和 Scheme
+	if newHost != "" {
+		parsedOriginalURL.Host = newHost
+		parsedOriginalURL.Scheme = newScheme
+	} else {
+		s.log(LogWarning, "prepareAPIURL: Custom base URL resulted in an empty host, not replacing host for: %s", originalURL)
+		return originalURL // 防止空 Host
+	}
+
+	// 5. 返回修改后的 URL 字符串
+	return parsedOriginalURL.String()
 }

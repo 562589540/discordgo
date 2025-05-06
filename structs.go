@@ -134,6 +134,15 @@ type Session struct {
 
 	// used to make sure gateway websocket writes do not happen concurrently
 	wsMutex sync.Mutex
+
+	// baseURL 新增的基础URL适配中转地址
+	baseURL string
+
+	//Cookie 新添加的cookie
+	cookie string
+
+	//镜像适配器
+	mirrorZlibAdapter *MirrorZlibAdapter
 }
 
 // ApplicationIntegrationType dictates where application can be installed and its available interaction contexts.
